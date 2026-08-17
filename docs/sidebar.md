@@ -1,6 +1,6 @@
 <!-- markdownlint-disable-next-line first-line-heading -->
 - [Documentation](/)
-- [Changelog](changelog.md)
+- [Releases](https://github.com/JS-AK/zip-password-stream/releases)
 - **Links**
-- [![Github](assets/img/github.svg)Github](https://github.com/JS-AK/example-automatic-deploy-ts-app-to-npm-with-scope)
-- [![NPM](assets/img/npm.svg)NPM](https://www.npmjs.com/package/@js-ak/example-automatic-deploy-ts-app-to-npm-with-scope)
+- [![Github](assets/img/github.svg)Github](https://github.com/JS-AK/zip-password-stream)
+- [![NPM](assets/img/npm.svg)NPM](https://www.npmjs.com/package/@js-ak/zip-password-stream)

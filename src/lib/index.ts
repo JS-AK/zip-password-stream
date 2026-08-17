@@ -1,1 +1,1 @@
-export const isTest = (str: string) => str === 'TEST'
+export const isTest = (str: string) => str === "TEST";
