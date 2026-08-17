@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "outDir": "./build/esm",
+    "declaration": true,
+    "declarationDir": "./build/types"
+  },
+  "exclude": ["build", "src/**/*.unit.spec.ts"]
+}

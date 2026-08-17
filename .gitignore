@@ -105,3 +105,11 @@ dist
 
 # TernJS port file
 .tern-port
+
+# AI
+.cursor/
+AGENTS.md
+TASK.md
+
+# IDE
+.vscode/
