@@ -6,9 +6,5 @@
     "declaration": true,
     "declarationDir": "./build/types"
   },
-  "exclude": [
-    "build",
-    "src/test/**/*",
-    "src/examples/**/*"
-  ]
+  "exclude": ["build", "src/test/**/*", "src/examples/**/*", "src/**/*.unit.spec.ts"]
 }

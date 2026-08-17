@@ -1,7 +1,7 @@
 {
   "name": "@js-ak/zip-password-stream",
   "version": "1.6.1",
-  "description": "zip-password-stream",
+  "description": "Streaming unzip for password-protected (ZipCrypto) zip archives in Node.js: one-pass parse of a Readable, entries as streams, no full-archive buffering, zero runtime dependencies.",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -35,28 +35,52 @@
     "build/types/index.d.ts",
     "LICENSE",
     "README.md",
-    "package.json"
+    "package.json",
+    "!build/**/*.unit.spec.js",
+    "!build/**/*.unit.spec.d.ts"
   ],
   "scripts": {
     "build": "npm run build:cjs && npm run build:esm",
     "build:esm": "tsc -p tsconfig.esm.json",
     "build:cjs": "tsc -p tsconfig.cjs.json",
-    "lint": "eslint .",
+    "format": "prettier --write .",
+    "lint": "prettier --check . && eslint .",
     "postbuild:esm": "node scripts/write-esm-package.js",
     "postbuild:cjs": "node scripts/write-cjs-package.js && node scripts/fix-cjs-import-meta.js",
-    "test": "npm run build && npm run test:unit && node --test src/test/cjs-require.test.js",
+    "test": "npm run build && npm run test:unit && npm run test:integration && node --test src/test/cjs-require.test.js && npm run test:floor",
+    "test:floor": "node --test src/test/engine-floor.test.js",
     "test:unit": "vitest run --config vitest.unit.config.js",
+    "test:integration": "vitest run --config vitest.integration.config.js",
     "test:coverage": "npm run build && vitest run --config vitest.unit.config.js --coverage"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=20.15.0"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JS-AK/zip-password-stream.git"
   },
   "keywords": [
-    "zip-password-stream"
+    "zip-password-stream",
+    "zip",
+    "unzip",
+    "zipcrypto",
+    "password",
+    "password-protected",
+    "encrypted-zip",
+    "decrypt",
+    "extract",
+    "archive",
+    "pkzip",
+    "stream",
+    "streaming",
+    "readable",
+    "backpressure",
+    "inflate",
+    "deflate",
+    "node",
+    "typescript",
+    "esm"
   ],
   "author": {
     "name": "JS-AK",
@@ -80,9 +104,11 @@
     "@typescript/native": "npm:typescript@7.0.2",
     "@vitest/coverage-v8": "4.1.10",
     "eslint": "10.8.0",
+    "eslint-config-prettier": "10.1.8",
     "eslint-plugin-sort-destructure-keys": "3.0.0",
     "eslint-plugin-sort-exports": "0.9.1",
     "globals": "17.7.0",
+    "prettier": "3.9.6",
     "semantic-release": "25.0.8",
     "typescript": "npm:@typescript/typescript6@6.0.2",
     "typescript-eslint": "8.65.0",

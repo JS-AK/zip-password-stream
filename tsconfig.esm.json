@@ -6,5 +6,5 @@
     "declaration": true,
     "declarationDir": "./build/types"
   },
-  "exclude": ["build"]
+  "exclude": ["build", "src/**/*.unit.spec.ts"]
 }

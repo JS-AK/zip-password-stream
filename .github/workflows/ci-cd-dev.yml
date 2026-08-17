@@ -2,7 +2,7 @@ name: CI CD dev
 
 on:
   push:
-    branches: ['dev']
+    branches: ["dev"]
 
 jobs:
   test:
@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ['20', '22', '24']
+        node-version: ["20", "22", "24"]
 
     steps:
       - name: Check out repository code
@@ -25,8 +25,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check Prettier
+        run: npx prettier --check .
+
       - name: Run ESLint
-        run: npm run lint
+        run: npx eslint .
 
       - name: Run Tests
         run: npm test
@@ -35,9 +38,42 @@ jobs:
         if: matrix.node-version == '24'
         run: npm run test:coverage
 
+  engine-floor:
+    name: Engine floor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v7
+
+      # Build on 20.x because Vitest and ESLint require Node >=20.19, while the
+      # compiled package must still run on the engines.node floor below.
+      - name: Setup Node.js 20 for the build
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Must match engines.node in package.json.
+      - name: Setup Node.js 20.15.0
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20.15.0"
+
+      - name: Run engine floor smoke test
+        run: |
+          node --version
+          npm run test:floor
+
   release:
     name: Release
-    needs: test
+    needs: [test, engine-floor]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -49,8 +85,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
           cache: npm
 
       - name: Install dependencies and build

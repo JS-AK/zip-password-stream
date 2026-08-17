@@ -3,17 +3,19 @@ import { createRequire } from "node:module";
 import { describe, it } from "node:test";
 
 const require = createRequire(import.meta.url);
-const { isTest } = require("../../build/cjs/index.js");
+const { isPdfMagic, isPdfPath, unzipEncrypted } = require("../../build/cjs/index.js");
 
 describe("cjs dual package", () => {
   it("loads via require()", () => {
-    assert.equal(typeof isTest, "function");
-    assert.equal(isTest("TEST"), true);
+    assert.equal(typeof unzipEncrypted, "function");
+    assert.equal(typeof isPdfPath, "function");
+    assert.equal(typeof isPdfMagic, "function");
   });
 
   it("resolves package exports for require()", () => {
     const pkg = require("../..");
-    assert.equal(typeof pkg.isTest, "function");
-    assert.equal(pkg.isTest("TEST"), true);
+    assert.equal(typeof pkg.unzipEncrypted, "function");
+    assert.equal(typeof pkg.isPdfPath, "function");
+    assert.equal(typeof pkg.isPdfMagic, "function");
   });
 });
