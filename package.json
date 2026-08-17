@@ -1,6 +1,6 @@
 {
   "name": "@js-ak/zip-password-stream",
-  "version": "1.6.1",
+  "version": "1.0.0",
   "description": "Streaming unzip for password-protected (ZipCrypto) zip archives in Node.js: one-pass parse of a Readable, entries as streams, no full-archive buffering, zero runtime dependencies.",
   "publishConfig": {
     "access": "public",
