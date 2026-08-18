@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/JS-AK/zip-password-stream/compare/v1.0.0...v1.1.0) (2026-08-18)
+
+
+### Features
+
+* add Zip.create/zipEncrypted writer and abort bit-3 scan on destroy ([ae36ac7](https://github.com/JS-AK/zip-password-stream/commit/ae36ac707189903c269d6372802b48460b9128e9))
+
 # 1.0.0 (2026-08-17)
 
 
