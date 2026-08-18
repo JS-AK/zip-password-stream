@@ -10,6 +10,8 @@ export const DATA_DESCRIPTOR_NO_SIG_LEN = 12;
 export const DATA_DESCRIPTOR_WITH_SIG_LEN = 16;
 /** Optional data-descriptor signature PK78 (APPNOTE). */
 export const DD_SIG = 0x08074b50;
+/** DOS date 1980-01-01 (day 1, month 1, year offset 0). Month/day 0 is invalid. */
+export const DOS_DATE_DEFAULT = 0x21;
 /** End of central directory signature (APPNOTE). */
 export const EOCD = 0x06054b50;
 /** End of central directory record length (APPNOTE). */
@@ -32,7 +34,7 @@ export const ZIPCRYPTO_HEADER_LEN = 12;
 export const ZIP_AES_METHOD = 99;
 /** APPNOTE general-purpose bit 3: CRC and sizes follow the payload. */
 export const ZIP_FLAG_DATA_DESCRIPTOR = 0x08;
-/** General-purpose bit 0: traditional PKZIP encryption. */
+/** General-purpose bit 0: traditional PKWARE encryption. */
 export const ZIP_FLAG_ENCRYPTED = 0x01;
 /** General-purpose bit 11: UTF-8 file name. */
 export const ZIP_FLAG_UTF8 = 0x800;
@@ -40,5 +42,7 @@ export const ZIP_FLAG_UTF8 = 0x800;
 export const ZIP_METHOD_DEFLATE = 8;
 /** Signature width shared by local/CD/EOCD/data-descriptor records. */
 export const ZIP_SIGNATURE_LEN = 4;
+/** Maximum value of a 16-bit zip field (name length, entry count). */
+export const ZIP_UINT16_MAX = 0xffff;
 /** Version needed to extract (2.0) in local and central headers (APPNOTE). */
 export const ZIP_VERSION_NEEDED = 20;

@@ -6,6 +6,7 @@ import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
@@ -24,6 +25,16 @@ import {
 } from "./test-support/write-zip.js";
 import { type UnzipOptions, type ZipEntry, unzipEncrypted } from "../lib/unzip.js";
 import { isPdfMagic, isPdfPath } from "../lib/detect/detect.js";
+
+/**
+ * Wall-clock guard for the unknown-length (APPNOTE bit 3) scan, not a benchmark:
+ * a block-wise scan of these fixtures costs milliseconds, while a per-byte
+ * re-inflate of the whole accumulator costs minutes. Keep the assertion — it is
+ * the only thing that fails when that scan becomes quadratic again.
+ */
+const SCAN_BUDGET_MS = 5000;
+/** Room for the budget assertion to be reported instead of killing the run. */
+const SCAN_TEST_TIMEOUT_MS = 20_000;
 
 function chunked(data: Buffer, size = 3): Readable {
   const chunks: Buffer[] = [];
@@ -97,7 +108,7 @@ describe("local header parser", () => {
     );
   });
 
-  it("throws when bit3 is set and local compressed size is 0", async () => {
+  it("throws when a stored entry has bit3 set and local compressed size is 0", async () => {
     const zip = writeDataDescriptorNoSizeStub("open.bin");
 
     await expect(collectNamed(Readable.from([zip]), "secret")).rejects.toThrow(
@@ -331,6 +342,17 @@ describe("optional password", () => {
     expect(out).toEqual(["a.txt", "nested/b.pdf", "c.bin"]);
   });
 
+  it("reads an unencrypted archive without options (one argument)", async () => {
+    const zip = writeZip(FIXTURE_FILES);
+    const out: string[] = [];
+
+    for await (const entry of unzipEncrypted(Readable.from([zip]))) {
+      out.push(entry.path);
+      await collect(entry);
+    }
+    expect(out).toEqual(["a.txt", "nested/b.pdf", "c.bin"]);
+  });
+
   it("names the entry that needs a password", async () => {
     const zip = writeZip(FIXTURE_FILES, { password: "secret" });
 
@@ -547,4 +569,392 @@ describe("password path", () => {
 
     expect(entries[0]?.data.equals(Buffer.from("hello\n"))).toBe(true);
   });
+});
+
+describe("unknown-length data descriptor", () => {
+  it("extracts an unencrypted deflate file with bit3 and omitted local sizes (16-byte descriptor)", async () => {
+    const zip = writeZip(
+      [{ data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" }],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(chunked(zip), "");
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.path).toBe("a.txt");
+    expect(entries[0]?.data.equals(Buffer.from("hello\n"))).toBe(true);
+  });
+
+  it("extracts an unencrypted deflate file with bit3 and omitted local sizes (12-byte descriptor)", async () => {
+    const zip = writeZip(
+      [{ data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" }],
+      { dataDescriptor: "12", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(chunked(zip), "");
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.path).toBe("a.txt");
+    expect(entries[0]?.data.equals(Buffer.from("hello\n"))).toBe(true);
+  });
+
+  it("extracts two unencrypted deflate files with omitted local sizes", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" },
+        { data: Buffer.from("world\n"), method: ZIP_METHOD_DEFLATE, name: "b.txt" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(chunked(zip), "");
+
+    expect(entries.map((e) => e.path)).toEqual(["a.txt", "b.txt"]);
+    expect(entries.map((e) => e.data.toString())).toEqual(["hello\n", "world\n"]);
+  });
+
+  it("extracts an encrypted deflate file with omitted local sizes", async () => {
+    const zip = writeZip(
+      [{ data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" }],
+      {
+        dataDescriptor: "16",
+        omitLocalSizes: true,
+        password: "secret",
+      },
+    );
+    const entries = await collectNamed(chunked(zip), "secret");
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.path).toBe("a.txt");
+    expect(entries[0]?.data.equals(Buffer.from("hello\n"))).toBe(true);
+  });
+
+  it("rejects a wrong password on an encrypted unknown-length entry", async () => {
+    const zip = writeZip(
+      [{ data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" }],
+      {
+        dataDescriptor: "16",
+        omitLocalSizes: true,
+        password: "secret",
+      },
+    );
+
+    await expect(collectNamed(Readable.from([zip]), "wrong")).rejects.toThrow(
+      /invalid zip password/,
+    );
+  });
+
+  it("skips a filtered unknown-length encrypted entry and yields the PDF", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" },
+        { data: TINY_PDF, method: ZIP_METHOD_DEFLATE, name: "nested/b.pdf" },
+      ],
+      {
+        dataDescriptor: "16",
+        omitLocalSizes: true,
+        password: "secret",
+      },
+    );
+    const entries = await collectNamed(chunked(zip), "secret", (name) => name.endsWith(".pdf"));
+
+    expect(entries.map((e) => e.path)).toEqual(["nested/b.pdf"]);
+    expect(entries[0]?.data.equals(TINY_PDF)).toBe(true);
+  });
+
+  it("extracts the next file after skipping an unknown-length encrypted entry", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" },
+        { data: TINY_PDF, method: ZIP_METHOD_DEFLATE, name: "nested/b.pdf" },
+      ],
+      {
+        dataDescriptor: "16",
+        omitLocalSizes: true,
+        password: "secret",
+      },
+    );
+    const seen: { data: Buffer; path: string }[] = [];
+
+    for await (const entry of unzipEncrypted(chunked(zip), { password: "secret" })) {
+      if (entry.path === "a.txt") {
+        await entry.autodrain();
+        continue;
+      }
+      seen.push({ data: await collect(entry), path: entry.path });
+    }
+
+    expect(seen.map((e) => e.path)).toEqual(["nested/b.pdf"]);
+    expect(seen[0]?.data.equals(TINY_PDF)).toBe(true);
+  });
+
+  it("throws when a yielded unknown-length entry exceeds maxEntrySize", async () => {
+    // 64 KB of zeros deflates to a few dozen bytes, so this stays cheap to scan.
+    const bomb = Buffer.alloc(64 * 1024, 0x00);
+    const zip = writeZip([{ data: bomb, method: ZIP_METHOD_DEFLATE, name: "bomb.bin" }], {
+      dataDescriptor: "16",
+      omitLocalSizes: true,
+    });
+
+    await expect(
+      collectNamed(chunked(zip, 8192), "", undefined, { maxEntrySize: 4096 }),
+    ).rejects.toThrow(/entry exceeds maxEntrySize: bomb\.bin/);
+  });
+
+  it(
+    "fails an unknown-length zip bomb before materialising it",
+    { timeout: SCAN_TEST_TIMEOUT_MS },
+    async () => {
+      // 8 MB of zeros deflates to a few KB: the cap has to bite during inflation,
+      // otherwise the whole 8 MB is allocated (and re-inflated) before it is seen.
+      const bomb = Buffer.alloc(8 * 1024 * 1024, 0x00);
+      const zip = writeZip([{ data: bomb, method: ZIP_METHOD_DEFLATE, name: "bomb.bin" }], {
+        dataDescriptor: "16",
+        omitLocalSizes: true,
+      });
+      const started = performance.now();
+
+      await expect(
+        collectNamed(chunked(zip, 8192), "", undefined, { maxEntrySize: 64 * 1024 }),
+      ).rejects.toThrow(/entry exceeds maxEntrySize: bomb\.bin/);
+
+      expect(performance.now() - started).toBeLessThan(SCAN_BUDGET_MS);
+    },
+  );
+
+  it("does not apply maxEntrySize to a filtered unknown-length entry", async () => {
+    // 1 MB of zeros is far past the cap while still deflating to ~1 KB, so today's
+    // per-byte scan reaches the wrong throw quickly.
+    const zip = writeZip(
+      [
+        { data: Buffer.alloc(1024 * 1024, 0x00), method: ZIP_METHOD_DEFLATE, name: "big.bin" },
+        { data: TINY_PDF, method: ZIP_METHOD_DEFLATE, name: "nested/b.pdf" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(chunked(zip, 8192), "", (name) => name.endsWith(".pdf"), {
+      maxEntrySize: 64 * 1024,
+    });
+
+    expect(entries.map((e) => e.path)).toEqual(["nested/b.pdf"]);
+    expect(entries[0]?.data.equals(TINY_PDF)).toBe(true);
+  });
+
+  it(
+    "continues iteration when a large unknown-length entry is destroyed unread",
+    { timeout: SCAN_TEST_TIMEOUT_MS },
+    async () => {
+      // Unread destroy() still inflates internally to the data descriptor (APPNOTE
+      // bit 3) so the next local header stays aligned — it is not a cheap skip.
+      const big = randomBytes(256 * 1024);
+      const zip = writeZip(
+        [
+          { data: big, method: ZIP_METHOD_DEFLATE, name: "big.bin" },
+          { data: Buffer.from("after\n"), method: ZIP_METHOD_DEFLATE, name: "after.txt" },
+        ],
+        { dataDescriptor: "16", omitLocalSizes: true },
+      );
+      const seen: string[] = [];
+      const started = performance.now();
+      let tail: Buffer | undefined;
+
+      for await (const entry of unzipEncrypted(chunked(zip, 8192), { password: "" })) {
+        seen.push(entry.path);
+        if (entry.path === "big.bin") {
+          entry.destroy();
+          continue;
+        }
+        tail = await collect(entry);
+      }
+
+      expect(seen).toEqual(["big.bin", "after.txt"]);
+      expect(tail?.equals(Buffer.from("after\n"))).toBe(true);
+      expect(performance.now() - started).toBeLessThan(SCAN_BUDGET_MS);
+    },
+  );
+
+  it(
+    "continues iteration when an unknown-length entry is destroyed mid-read",
+    { timeout: SCAN_TEST_TIMEOUT_MS },
+    async () => {
+      const big = randomBytes(256 * 1024);
+      const zip = writeZip(
+        [
+          { data: big, method: ZIP_METHOD_DEFLATE, name: "big.bin" },
+          { data: Buffer.from("after\n"), method: ZIP_METHOD_DEFLATE, name: "after.txt" },
+        ],
+        { dataDescriptor: "16", omitLocalSizes: true, password: "secret" },
+      );
+      const seen: string[] = [];
+      let tail: Buffer | undefined;
+
+      for await (const entry of unzipEncrypted(chunked(zip, 8192), { password: "secret" })) {
+        seen.push(entry.path);
+        if (entry.path === "big.bin") {
+          // Unknown-length pushes only after Z_STREAM_END, so `once("readable")`
+          // would wait for the full scan. Start consume then destroy on this turn.
+          entry.read();
+          entry.destroy();
+          continue;
+        }
+        tail = await collect(entry);
+      }
+
+      expect(seen).toEqual(["big.bin", "after.txt"]);
+      expect(tail?.equals(Buffer.from("after\n"))).toBe(true);
+    },
+  );
+
+  it("extracts a directory then a file when the directory is unknown-length deflate", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.alloc(0), directory: true, method: ZIP_METHOD_DEFLATE, name: "dir/" },
+        { data: Buffer.from("hello"), name: "a.txt" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const seen: {
+      data: Buffer;
+      directory: boolean;
+      path: string;
+      type: ZipEntry["type"];
+    }[] = [];
+
+    for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+      seen.push({
+        data: await collect(entry),
+        directory: entry.isDirectory(),
+        path: entry.path,
+        type: entry.type,
+      });
+    }
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.path).toBe("dir/");
+    expect(seen[0]?.type).toBe("Directory");
+    expect(seen[0]?.directory).toBe(true);
+    expect(seen[1]?.path).toBe("a.txt");
+    expect(seen[1]?.type).toBe("File");
+    expect(seen[1]?.data.equals(Buffer.from("hello"))).toBe(true);
+  });
+
+  it("still yields the next file after skipping an unknown-length deflate directory", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.alloc(0), directory: true, method: ZIP_METHOD_DEFLATE, name: "dir/" },
+        { data: Buffer.from("hello"), name: "a.txt" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(Readable.from([zip]), "", (p) => p !== "dir/");
+
+    expect(entries.map((e) => e.path)).toEqual(["a.txt"]);
+    expect(entries[0]?.data.equals(Buffer.from("hello"))).toBe(true);
+  });
+
+  it("extracts a yielded unknown-length directory then a file from chunked input", async () => {
+    const zip = writeZip(
+      [
+        { data: Buffer.alloc(0), directory: true, method: ZIP_METHOD_DEFLATE, name: "dir/" },
+        { data: Buffer.from("hello"), name: "a.txt" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(chunked(zip), "");
+
+    expect(entries.map((e) => e.path)).toEqual(["dir/", "a.txt"]);
+    expect(entries[0]?.type).toBe("Directory");
+    expect(entries[1]?.data.equals(Buffer.from("hello"))).toBe(true);
+  });
+});
+
+describe("ZipEntry helpers", () => {
+  it("reports a file entry as isFile() and not isDirectory()", async () => {
+    const zip = writeZip(FIXTURE_FILES);
+    const flags: { directory: boolean; file: boolean; path: string }[] = [];
+
+    for await (const entry of unzipEncrypted(chunked(zip), { password: "" })) {
+      flags.push({
+        directory: entry.isDirectory(),
+        file: entry.isFile(),
+        path: entry.path,
+      });
+      await collect(entry);
+    }
+
+    expect(flags).toEqual([
+      { directory: false, file: true, path: "a.txt" },
+      { directory: false, file: true, path: "nested/b.pdf" },
+      { directory: false, file: true, path: "c.bin" },
+    ]);
+  });
+
+  it("reports a directory entry as isDirectory() and not isFile()", async () => {
+    const dirHeader = writeLocalHeaderOnly({
+      compressedSize: 4,
+      method: 0,
+      name: "foo/",
+      uncompressedSize: 4,
+    });
+    const zip = Buffer.concat([
+      dirHeader,
+      Buffer.from("junk"),
+      writeZip([{ data: Buffer.from("hello\n"), method: 0, name: "a.txt" }]),
+    ]);
+    const flags: { directory: boolean; file: boolean; path: string }[] = [];
+
+    for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+      flags.push({
+        directory: entry.isDirectory(),
+        file: entry.isFile(),
+        path: entry.path,
+      });
+      await collect(entry);
+    }
+
+    expect(flags).toEqual([
+      { directory: true, file: false, path: "foo/" },
+      { directory: false, file: true, path: "a.txt" },
+    ]);
+  });
+
+  it("safeName() returns the basename of a backslash path", async () => {
+    const zip = writeZip([{ data: Buffer.from("pdf"), method: 0, name: "a\\b\\c.pdf" }]);
+    let safe: string | undefined;
+
+    for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+      safe = entry.safeName();
+      await collect(entry);
+    }
+
+    expect(safe).toBe("c.pdf");
+  });
+
+  it("safeName() returns the basename after parent-directory segments", async () => {
+    const zip = writeZip([{ data: Buffer.from("x"), method: 0, name: "foo/../etc/passwd" }]);
+    let safe: string | undefined;
+
+    for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+      safe = entry.safeName();
+      await collect(entry);
+    }
+
+    expect(safe).toBe("passwd");
+  });
+
+  it.each(["..", ".", "", "foo/.."] as const)(
+    "safeName() throws for an unsafe name %j",
+    async (name) => {
+      const zip = writeZip([{ data: Buffer.from("x"), method: 0, name }]);
+
+      await expect(
+        (async () => {
+          for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+            try {
+              entry.safeName();
+            } finally {
+              await collect(entry);
+            }
+          }
+        })(),
+      ).rejects.toThrow(/unsafe entry name/);
+    },
+  );
 });

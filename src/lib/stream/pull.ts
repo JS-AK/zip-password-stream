@@ -7,6 +7,11 @@ import type { Readable } from "node:stream";
 export type PullReader = {
   /** Return exactly `n` bytes, or fewer/null at EOF. */
   read(n: number): Promise<Buffer | null>;
+  /**
+   * Push bytes back so the next `read` returns them first. Used when inflate
+   * overshoots into the data descriptor.
+   */
+  unread(buf: Buffer): void;
   /** Skip `n` bytes without copying them out to a consumer. */
   discard(n: number): Promise<void>;
   /** Release the source stream. Idempotent. */
@@ -25,14 +30,16 @@ export const PULL_CHUNK_SIZE = 64 * 1024;
 /**
  * Wrap a stream chunk without copying. A producer must not mutate a chunk after
  * pushing it, so queued chunks are treated as read-only and never modified here.
+ * A `Uint8Array` view keeps `byteOffset` (do not wrap the whole ArrayBuffer).
  */
-function asBuffer(value: unknown): Buffer {
+export function asBuffer(value: unknown): Buffer {
   if (Buffer.isBuffer(value)) {
     return value;
   }
   if (value instanceof Uint8Array) {
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   }
+  // Node Readable can emit strings when `decodeStrings` is false.
   if (typeof value === "string") {
     return Buffer.from(value);
   }
@@ -155,6 +162,23 @@ export function createPull(source: Readable): PullReader {
   }
 
   /**
+   * Prepend `buf` ahead of leftover, including leftover still sitting in the
+   * current head after a partial `read` (`offset > 0`). Empty is a no-op so
+   * inflate can unread a zero-length overshoot without touching the queue.
+   */
+  function unread(buf: Buffer): void {
+    if (buf.length === 0) {
+      return;
+    }
+    if (index < queue.length && offset > 0) {
+      queue[index] = headChunk().subarray(offset);
+      offset = 0;
+    }
+    queue.splice(index, 0, buf);
+    queued += buf.length;
+  }
+
+  /**
    * Skip `n` bytes without copying them to a consumer. Short source is fatal:
    * a local header already promised that many ciphertext bytes.
    */
@@ -188,5 +212,5 @@ export function createPull(source: Readable): PullReader {
     await iter.return?.();
   }
 
-  return { discard, dispose, read };
+  return { discard, dispose, read, unread };
 }
