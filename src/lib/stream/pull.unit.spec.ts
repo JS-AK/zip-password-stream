@@ -2,7 +2,7 @@ import { Readable } from "node:stream";
 
 import { describe, expect, it } from "vitest";
 
-import { createPull } from "./pull.js";
+import { asBuffer, createPull } from "./pull.js";
 
 function chunked(data: Buffer, sizes: number[]): Readable {
   const chunks: Buffer[] = [];
@@ -113,5 +113,53 @@ describe("createPull", () => {
     await pull.dispose();
 
     expect(source.destroyed).toBe(true);
+  });
+
+  it("returns unread bytes before queued leftover", async () => {
+    const pull = createPull(Readable.from([Buffer.from("cd")]));
+
+    pull.unread(Buffer.from("ab"));
+
+    expect((await pull.read(4))?.toString()).toBe("abcd");
+  });
+
+  it("unread after a partial read sits before the rest of that chunk", async () => {
+    const pull = createPull(Readable.from([Buffer.from("abcdefgh")]));
+
+    expect((await pull.read(3))?.toString()).toBe("abc");
+    pull.unread(Buffer.from("XY"));
+
+    expect((await pull.read(7))?.toString()).toBe("XYdefgh");
+  });
+
+  it("treats an empty unread as a no-op", async () => {
+    const pull = createPull(Readable.from([Buffer.from("ab")]));
+
+    pull.unread(Buffer.alloc(0));
+
+    expect((await pull.read(2))?.toString()).toBe("ab");
+  });
+});
+
+describe("asBuffer", () => {
+  it("keeps a Uint8Array view's byteOffset", () => {
+    const backing = new Uint8Array([0, 1, 2, 3, 4]);
+    const view = backing.subarray(1, 4);
+
+    expect(asBuffer(view).equals(Buffer.from([1, 2, 3]))).toBe(true);
+  });
+
+  it("returns a Buffer without copying", () => {
+    const chunk = Buffer.from("ab");
+
+    expect(asBuffer(chunk)).toBe(chunk);
+  });
+
+  it("encodes a string chunk (decodeStrings false)", () => {
+    expect(asBuffer("ab").equals(Buffer.from("ab"))).toBe(true);
+  });
+
+  it("throws on an unsupported chunk type", () => {
+    expect(() => asBuffer(1)).toThrow(/unsupported readable chunk type/);
   });
 });

@@ -1,5 +1,5 @@
 import { Readable, type ReadableOptions, Writable } from "node:stream";
-import { crc32, createInflateRaw } from "node:zlib";
+import { crc32, createInflateRaw, inflateRawSync } from "node:zlib";
 import { finished, pipeline } from "node:stream/promises";
 
 import { once } from "node:events";
@@ -26,6 +26,8 @@ import {
 } from "./zip/constants.js";
 import { PULL_CHUNK_SIZE, type PullReader, createPull } from "./stream/pull.js";
 import { type ZipCrypto, createZipCrypto, expectedCheckByte } from "./zip/crypto.js";
+import { entrySafeName } from "./zip/entry-name.js";
+import { toError } from "./stream/to-error.js";
 
 /** Password and filter options for one-pass ZipCrypto unzip. */
 export type UnzipOptions = {
@@ -33,10 +35,14 @@ export type UnzipOptions = {
   password?: string;
   /** OEM/cp437 archives; default is UTF-8. */
   passwordEncoding?: BufferEncoding;
-  /** If false, discard ciphertext by size (no inflate, no yield). */
+  /**
+   * Yield when true. If false, skip: known-size discards ciphertext (no inflate);
+   * unknown-length bit-3 still inflates to find the descriptor.
+   */
   filter?: (path: string) => boolean;
   /**
-   * Hard cap on uncompressed bytes per entry. Unlimited when unset.
+   * Hard cap on uncompressed bytes per yielded entry (and writer `add`).
+   * Unlimited when unset. Does not apply to skipped entries.
    * Local-header sizes are attacker-controlled, so only this bounds a zip bomb.
    */
   maxEntrySize?: number;
@@ -53,6 +59,37 @@ export type ZipEntry = Readable & {
   uncompressedSize?: number;
   encrypted: boolean;
   autodrain(): Promise<void>;
+  /** `type === "File"`. */
+  isFile(): boolean;
+  /** `type === "Directory"`. */
+  isDirectory(): boolean;
+  /**
+   * Basename after `\` → `/`. Throws `unsafe entry name: <path>` when the
+   * result is empty, `.`, or `..`.
+   */
+  safeName(): string;
+};
+
+/**
+ * Node `inflateRawSync` sets this `code` when the raw deflate stream is
+ * truncated. That is the scan-continue signal (`errorCode` only).
+ */
+const ZLIB_INCOMPLETE_CODE = "Z_BUF_ERROR";
+
+/**
+ * Node throws this `code` when `maxOutputLength` would be exceeded, so a zip
+ * bomb can fail without allocating the uncompressed payload.
+ */
+const ERR_BUFFER_TOO_LARGE = "ERR_BUFFER_TOO_LARGE";
+
+/**
+ * `inflateRawSync(..., { info: true })` — @types/node only lists the Buffer
+ * return, but Node yields the inflated bytes plus how many input bytes ended
+ * the stream (`engine.bytesWritten`).
+ */
+type InflateRawInfoResult = {
+  buffer: Buffer;
+  engine: { bytesWritten: number };
 };
 
 type EntryMeta = {
@@ -65,6 +102,19 @@ type EntryMeta = {
 
 type BodyCursor = {
   remaining: number;
+  /**
+   * Local compressedSize is 0 with APPNOTE bit 3 and deflate **file**:
+   * `remaining` is not a ciphertext bound. Directories are never unknown-length
+   * (empty method-8 dirs have no deflate bytes; the next 16 are PK78).
+   */
+  unknownLength: boolean;
+  /** Raw deflate plaintext (after ZipCrypto) accumulated while scanning. */
+  deflatePlain: Buffer;
+  /**
+   * Z_STREAM_END was reached, or inflate failed fatally. Do not read more
+   * ciphertext — further bytes are the plaintext data descriptor.
+   */
+  deflateScanDone: boolean;
 };
 
 type BodyResult = {
@@ -118,6 +168,25 @@ class ZipEntryStream extends Readable implements ZipEntry {
         },
       }),
     );
+  }
+
+  /** `type === "File"`. */
+  isFile(): boolean {
+    return this.type === "File";
+  }
+
+  /** `type === "Directory"`. */
+  isDirectory(): boolean {
+    return this.type === "Directory";
+  }
+
+  /**
+   * Basename after POSIX-normalizing `\` (not `node:path`, so `\` is a separator
+   * on every platform). Trailing `/` is stripped so directory entries still
+   * have a name.
+   */
+  safeName(): string {
+    return entrySafeName(this.path);
   }
 }
 
@@ -207,18 +276,174 @@ async function skipEncryptedHeader(
   }
 }
 
+function errorCode(err: Error): string | undefined {
+  return "code" in err && typeof err.code === "string" ? err.code : undefined;
+}
+
+function isIncompleteInflate(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+
+  return errorCode(err) === ZLIB_INCOMPLETE_CODE;
+}
+
+/** `maxOutputLength` (and Node's buffer cap) without allocating a zip bomb. */
+function isMaxOutputExceeded(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+
+  return errorCode(err) === ERR_BUFFER_TOO_LARGE;
+}
+
 /**
- * Advance past unused ciphertext by size (no inflate). If bit 3 is set,
- * still consume the data descriptor so the next signature is aligned.
+ * APPNOTE bit 3: sizes live in the data descriptor after the payload. Chunked
+ * `inflateRawSync({ info: true })` finds Z_STREAM_END without a 1-byte scan.
+ * The descriptor is plaintext even for ZipCrypto — decrypting past the stream
+ * would XOR it — so overshoot is unread as the last **raw** (undecrypted) bytes.
+ */
+function inflateUnknownLength(
+  input: Buffer,
+  maxOutputLength: number | undefined,
+): InflateRawInfoResult {
+  const result: unknown = inflateRawSync(input, {
+    info: true,
+    ...(maxOutputLength !== undefined ? { maxOutputLength } : {}),
+  });
+
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    !("buffer" in result) ||
+    !Buffer.isBuffer(result.buffer) ||
+    !("engine" in result) ||
+    typeof result.engine !== "object" ||
+    result.engine === null ||
+    !("bytesWritten" in result.engine) ||
+    typeof result.engine.bytesWritten !== "number"
+  ) {
+    throw new Error("inflateRawSync({ info: true }) returned an unexpected shape");
+  }
+
+  return {
+    buffer: result.buffer,
+    engine: { bytesWritten: result.engine.bytesWritten },
+  };
+}
+
+/**
+ * Next body chunk. `Promise.race` does not cancel `pull.read`: if the yielded
+ * entry is destroyed while a read is in flight, those bytes must still be
+ * awaited and unread so skipRest can find the data descriptor. Omit `entry`
+ * on filter/unread skip — APPNOTE bit 3 still inflates to PK78.
+ */
+async function readPullChunk(
+  pull: PullReader,
+  entry: ZipEntryStream | undefined,
+): Promise<Buffer | null> {
+  if (entry === undefined) {
+    return pull.read(PULL_CHUNK_SIZE);
+  }
+
+  const pending = pull.read(PULL_CHUNK_SIZE);
+
+  try {
+    return await raceEntryAbort(entry, pending);
+  } catch (err) {
+    try {
+      const buf = await pending;
+
+      if (buf && buf.length > 0) {
+        pull.unread(buf);
+      }
+    } catch {
+      /* keep abort; skipRest may still fail on the source */
+    }
+    throw toError(err);
+  }
+}
+
+/**
+ * APPNOTE bit 3 may omit local crc/sizes. Stored has no terminator, so v1
+ * still throws. Deflate can find the end: the first successful
+ * `inflateRawSync({ info: true })` is Z_STREAM_END. Extra bytes in the last
+ * pull chunk are the plaintext descriptor (and possibly the next signature);
+ * unread the raw overshoot instead of consuming them as ciphertext.
+ * On the yielded path, `entry.destroy()` aborts the scan (no push). Skip
+ * omits `entry` so unread destroy still inflates to the descriptor.
+ */
+async function readUnknownLengthDeflate(
+  pull: PullReader,
+  cursor: BodyCursor,
+  crypto: ZipCrypto | undefined,
+  maxOutputLength?: number,
+  name?: string,
+  entry?: ZipEntryStream,
+): Promise<Buffer> {
+  while (!cursor.deflateScanDone) {
+    if (entry?.destroyed) {
+      throw entryFailError(entry);
+    }
+    const raw = await readPullChunk(pull, entry);
+
+    if (!raw || raw.length === 0) {
+      throw new Error("unexpected EOF while reading file data");
+    }
+    const plain = crypto ? crypto.decrypt(raw) : raw;
+
+    cursor.deflatePlain = Buffer.concat([cursor.deflatePlain, plain]);
+    let output: Buffer;
+
+    try {
+      const result = inflateUnknownLength(cursor.deflatePlain, maxOutputLength);
+      const overshoot = cursor.deflatePlain.length - result.engine.bytesWritten;
+
+      if (overshoot > 0) {
+        // Raw suffix, not decrypted: ZipCrypto descriptor bytes were never cipher.
+        pull.unread(raw.subarray(raw.length - overshoot));
+      }
+      cursor.deflatePlain = cursor.deflatePlain.subarray(0, result.engine.bytesWritten);
+      cursor.deflateScanDone = true;
+      output = result.buffer;
+    } catch (err) {
+      if (isIncompleteInflate(err)) {
+        continue;
+      }
+      cursor.deflateScanDone = true;
+      if (isMaxOutputExceeded(err) && name !== undefined) {
+        throw new Error(`entry exceeds maxEntrySize: ${name}`);
+      }
+      throw toError(err);
+    }
+    if (entry?.destroyed) {
+      throw entryFailError(entry);
+    }
+
+    return output;
+  }
+
+  return inflateUnknownLength(cursor.deflatePlain, maxOutputLength).buffer;
+}
+
+/**
+ * Advance past unused ciphertext. Known size: discard by length (no inflate).
+ * Unknown-length deflate: inflate-to-end so the plaintext descriptor aligns;
+ * `discard(0)` would treat deflate bytes as a descriptor. Skipped entries do
+ * not apply `maxEntrySize` — the cap is for yielded bodies only.
  */
 async function skipRemaining(
   pull: PullReader,
-  remaining: number,
+  cursor: BodyCursor,
   dataDescriptor: boolean,
+  crypto: ZipCrypto | undefined,
   name: string,
 ): Promise<void> {
-  if (remaining > 0) {
-    await pull.discard(remaining);
+  if (cursor.unknownLength && !cursor.deflateScanDone) {
+    await readUnknownLengthDeflate(pull, cursor, crypto);
+  } else if (cursor.remaining > 0) {
+    await pull.discard(cursor.remaining);
+    cursor.remaining = 0;
   }
   if (dataDescriptor) {
     await readDataDescriptor(pull, name);
@@ -336,6 +561,32 @@ async function pumpBody(
     return { crc: 0, size: 0 };
   }
 
+  if (cursor.unknownLength) {
+    const output = await readUnknownLengthDeflate(
+      pull,
+      cursor,
+      crypto,
+      options.maxEntrySize,
+      entry.path,
+      entry,
+    );
+
+    if (entry.destroyed) {
+      throw entryFailError(entry);
+    }
+    checkGrowth(output.length, options, entry.path);
+    const outCrc = crc32(output) >>> 0;
+
+    assertSize(output.length, expectedSize, entry.path);
+    assertCrc(outCrc, expectedCrc, entry.path);
+    if (output.length > 0 && !entry.push(output)) {
+      await waitForDemand(entry);
+    }
+    entry.push(null);
+
+    return { crc: outCrc, size: output.length };
+  }
+
   if (cursor.remaining <= 0) {
     assertSize(0, expectedSize, entry.path);
     assertCrc(0, expectedCrc, entry.path);
@@ -355,7 +606,7 @@ async function pumpBody(
       try {
         checkGrowth(written, options, entry.path);
       } catch (err) {
-        inflate.destroy(err instanceof Error ? err : new Error(String(err)));
+        inflate.destroy(toError(err));
 
         return;
       }
@@ -372,7 +623,7 @@ async function pumpBody(
           entry.push(null);
         }
       } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+        const error = toError(err);
 
         entry.destroy(error);
       }
@@ -415,7 +666,7 @@ async function pumpBody(
       }
     } catch (err) {
       inflate.destroy();
-      throw err instanceof Error ? err : new Error(String(err));
+      throw toError(err);
     }
 
     return { crc: outCrc, size: written };
@@ -450,7 +701,9 @@ async function pumpBody(
 
 /**
  * Walk local file headers until CD/EOCD (APPNOTE). One ZipCrypto state per
- * encrypted entry; yield before reading the body so skip can discard by size.
+ * encrypted entry; yield before reading the body so skip can discard by size
+ * when the local header has one. Unknown-length deflate inflates to the
+ * descriptor instead of discarding.
  */
 async function* parseEntries(
   pull: PullReader,
@@ -513,10 +766,6 @@ async function* parseEntries(
     const encrypted = Boolean(flags & ZIP_FLAG_ENCRYPTED);
     const dataDescriptor = Boolean(flags & ZIP_FLAG_DATA_DESCRIPTOR);
 
-    if (dataDescriptor && compressedSize === 0) {
-      throw new Error(`no size in local header: ${name}`);
-    }
-
     // Only "/" marks a directory in the spec. A trailing "\" is accepted too,
     // but never for an entry that carries data — that body must not be dropped.
     const bodyBytes = encrypted
@@ -525,23 +774,44 @@ async function* parseEntries(
     const type: "File" | "Directory" =
       name.endsWith("/") || (name.endsWith("\\") && bodyBytes === 0) ? "Directory" : "File";
 
-    const cursor: BodyCursor = { remaining: compressedSize };
+    // Stored has no end marker; deflate's Z_STREAM_END is the byte before the
+    // plaintext descriptor. Empty method-8 directories have no deflate payload
+    // — scanning would consume the PK78 descriptor — so only files scan.
+    const unknownLength =
+      dataDescriptor &&
+      compressedSize === 0 &&
+      method === ZIP_METHOD_DEFLATE &&
+      type !== "Directory";
+
+    if (dataDescriptor && compressedSize === 0 && method !== ZIP_METHOD_DEFLATE) {
+      throw new Error(`no size in local header: ${name}`);
+    }
+
+    const cursor: BodyCursor = {
+      deflatePlain: Buffer.alloc(0),
+      deflateScanDone: false,
+      remaining: compressedSize,
+      unknownLength,
+    };
     let crypto: ZipCrypto | undefined;
 
     if (encrypted) {
       if (password === undefined) {
         throw new Error(`password required: ${name}`);
       }
-      if (cursor.remaining < ZIPCRYPTO_HEADER_LEN) {
+      // Local compressedSize 0 is not a bound on the 12-byte header.
+      if (!unknownLength && cursor.remaining < ZIPCRYPTO_HEADER_LEN) {
         throw new Error(`truncated zip crypto header: ${name}`);
       }
       crypto = createZipCrypto(password);
       await skipEncryptedHeader(pull, crypto, flags, crc, modTime, name);
-      cursor.remaining -= ZIPCRYPTO_HEADER_LEN;
+      if (!unknownLength) {
+        cursor.remaining -= ZIPCRYPTO_HEADER_LEN;
+      }
     }
 
     if (options.filter && !options.filter(name)) {
-      await skipRemaining(pull, cursor.remaining, dataDescriptor, name);
+      await skipRemaining(pull, cursor, dataDescriptor, crypto, name);
       continue;
     }
 
@@ -593,7 +863,7 @@ async function* parseEntries(
     let started = false;
 
     const skipRest = async (): Promise<void> => {
-      await skipRemaining(pull, cursor.remaining, dataDescriptor && !descriptorSkipped, name);
+      await skipRemaining(pull, cursor, dataDescriptor && !descriptorSkipped, crypto, name);
       cursor.remaining = 0;
       descriptorSkipped = dataDescriptor;
     };
@@ -607,13 +877,20 @@ async function* parseEntries(
           const descriptor = await readDataDescriptor(pull, name);
 
           descriptorSkipped = true;
-          assertSize(descriptor.compressedSize, compressedSize, name);
+          if (compressedSize !== 0) {
+            assertSize(descriptor.compressedSize, compressedSize, name);
+          } else {
+            const expectedCompressed =
+              (encrypted ? ZIPCRYPTO_HEADER_LEN : 0) + cursor.deflatePlain.length;
+
+            assertSize(descriptor.compressedSize, expectedCompressed, name);
+          }
           assertSize(descriptor.uncompressedSize, body.size, name);
           assertCrc(body.crc, descriptor.crc, name);
         }
         resolveDone();
       } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+        const error = toError(err);
         // A finished body that fails later (bad descriptor) is a real error, even
         // though `autoDestroy` already closed the entry without an error.
         const abortedByConsumer = !bodyDone && entry.destroyed && !entry.errored;
@@ -665,7 +942,7 @@ async function* parseEntries(
  */
 export async function* unzipEncrypted(
   source: Readable,
-  options: UnzipOptions,
+  options: UnzipOptions = {},
 ): AsyncGenerator<ZipEntry, void, unknown> {
   const pull = createPull(source);
 

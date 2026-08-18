@@ -1,4 +1,5 @@
 import { LOCAL, ZIP_SIGNATURE_LEN } from "../zip/constants.js";
+import { posixBasename } from "../zip/entry-name.js";
 
 /** File kinds this module can recognize from magic bytes or a basename. */
 export type DetectKind =
@@ -166,8 +167,7 @@ function matchMagic(kind: DetectKind, chunk: Uint8Array): boolean {
 }
 
 function matchPath(kind: DetectKind, name: string): boolean {
-  const normalized = name.replaceAll("\\", "/");
-  const base = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+  const base = posixBasename(name).toLowerCase();
 
   return KIND_SPECS[kind].extensions.some((ext) => base.endsWith(ext));
 }

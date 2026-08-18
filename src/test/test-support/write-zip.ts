@@ -9,6 +9,7 @@ import {
   DATA_DESCRIPTOR_NO_SIG_LEN,
   DATA_DESCRIPTOR_WITH_SIG_LEN,
   DD_SIG,
+  DOS_DATE_DEFAULT,
   EOCD,
   EOCD_LEN,
   LOCAL,
@@ -24,6 +25,24 @@ import {
 } from "../../lib/zip/constants.js";
 import { createZipCrypto, expectedCheckByte } from "../../lib/zip/crypto.js";
 
+/** Writer knobs for password, UTF-8 names, and data-descriptor layouts. */
+export type FixtureZipOptions = {
+  password?: string;
+  passwordEncoding?: BufferEncoding;
+  utf8?: boolean;
+  dataDescriptor?: "none" | "12" | "16";
+  /** Write a wrong crc/size into the data descriptor to test validation. */
+  corruptDescriptor?: "crc" | "uncompressedSize" | "compressedSize";
+  /** Leave the local header crc at 0, as streaming writers do with bit 3. */
+  zeroLocalCrc?: boolean;
+  /**
+   * Zero local-header crc, compressedSize, and uncompressedSize.
+   * Only applies when `dataDescriptor` is `"12"` or `"16"` (bit 3 stays set).
+   * The payload and data descriptor still carry real crc/sizes; the CD does too.
+   */
+  omitLocalSizes?: boolean;
+};
+
 /** One file (or directory) to pack into a test zip. */
 export type ZipWriteFile = {
   name: string;
@@ -33,25 +52,15 @@ export type ZipWriteFile = {
   modTime?: number;
   modDate?: number;
 };
-/** Writer knobs for password, UTF-8 names, and data-descriptor layouts. */
-export type ZipWriteOptions = {
-  password?: string;
-  passwordEncoding?: BufferEncoding;
-  utf8?: boolean;
-  dataDescriptor?: "none" | "12" | "16";
-  /** Write a wrong crc/size into the data descriptor to test validation. */
-  corruptDescriptor?: "crc" | "uncompressedSize" | "compressedSize";
-  /** Leave the local header crc at 0, as streaming writers do with bit 3. */
-  zeroLocalCrc?: boolean;
-};
 
 /** AE-1 vendor version stored in a WinZip AES extra payload. */
 const AES_EXTRA_AE1 = 0x0001;
-const DOS_DATE_DEFAULT = 0x21;
 /** Claimed extra payload size larger than the buffer, so the parser must reject it. */
 const MALFORMED_EXTRA_CLAIMED_SIZE = 20;
 const MALFORMED_EXTRA_ID = 0x7777;
 const TINY_PDF_BODY = Buffer.from("%PDF-1.1\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
+/** Minimal JPEG SOI used as a `.jpg` entry body in tests. */
+const TINY_JPEG_BODY = Buffer.from([0xff, 0xd8, 0xff, 0x00]);
 
 /** Shared three-file archive used by parser, fixture, and README tests. */
 export const FIXTURE_FILES: ZipWriteFile[] = [
@@ -59,6 +68,10 @@ export const FIXTURE_FILES: ZipWriteFile[] = [
   { data: TINY_PDF_BODY, method: ZIP_METHOD_DEFLATE, name: "nested/b.pdf" },
   { data: Buffer.from([0x00, 0x01, 0x02]), method: 0, name: "c.bin" },
 ];
+
+/** Tiny JPEG bytes used as a `.jpg` zip entry body. */
+export const TINY_JPEG = TINY_JPEG_BODY;
+
 /** Tiny PDF bytes used as a nested zip entry and as `isPdfMagic` input. */
 export const TINY_PDF = TINY_PDF_BODY;
 
@@ -265,7 +278,7 @@ export function writeMalformedExtraStub(name: string): Buffer {
 }
 
 /** Build a ZipCrypto or plain zip in memory for tests. */
-export function writeZip(files: ZipWriteFile[], options: ZipWriteOptions = {}): Buffer {
+export function writeZip(files: ZipWriteFile[], options: FixtureZipOptions = {}): Buffer {
   const utf8 = options.utf8 !== false;
   const parts: Buffer[] = [];
   const entries: WrittenEntry[] = [];
@@ -311,6 +324,9 @@ export function writeZip(files: ZipWriteFile[], options: ZipWriteOptions = {}): 
       body = payload;
     }
 
+    const omitLocalSizes =
+      Boolean(options.omitLocalSizes) &&
+      (options.dataDescriptor === "12" || options.dataDescriptor === "16");
     const local = Buffer.alloc(LOCAL_FILE_HEADER_LEN);
 
     local.writeUInt32LE(LOCAL, 0);
@@ -319,9 +335,9 @@ export function writeZip(files: ZipWriteFile[], options: ZipWriteOptions = {}): 
     local.writeUInt16LE(method, 8);
     local.writeUInt16LE(modTime, 10);
     local.writeUInt16LE(modDate, 12);
-    local.writeUInt32LE(options.zeroLocalCrc ? 0 : crc, 14);
-    local.writeUInt32LE(body.length, 18);
-    local.writeUInt32LE(data.length, 22);
+    local.writeUInt32LE(omitLocalSizes || options.zeroLocalCrc ? 0 : crc, 14);
+    local.writeUInt32LE(omitLocalSizes ? 0 : body.length, 18);
+    local.writeUInt32LE(omitLocalSizes ? 0 : data.length, 22);
     local.writeUInt16LE(nameBuf.length, 26);
     local.writeUInt16LE(0, 28);
 
