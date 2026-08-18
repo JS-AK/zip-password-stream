@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/JS-AK/zip-password-stream/compare/v1.1.0...v1.1.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* mention zip write in the npm package description ([430402c](https://github.com/JS-AK/zip-password-stream/commit/430402c1100f897dd152e65c0f2f156caa72e934))
+
 # [1.1.0](https://github.com/JS-AK/zip-password-stream/compare/v1.0.0...v1.1.0) (2026-08-18)
 
 
