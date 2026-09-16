@@ -103,7 +103,7 @@
     "@types/node": "26.1.1",
     "@typescript/native": "npm:typescript@7.0.2",
     "@vitest/coverage-v8": "4.1.10",
-    "eslint": "10.8.0",
+    "eslint": "10.10.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-sort-destructure-keys": "3.0.0",
     "eslint-plugin-sort-exports": "0.9.1",
