@@ -1,16 +1,26 @@
 import { Readable, Transform, Writable } from "node:stream";
+import { crc32, createDeflateRaw } from "node:zlib";
+import { finished, pipeline } from "node:stream/promises";
 import { mkdtemp, unlink } from "node:fs/promises";
-import { crc32 } from "node:zlib";
 import { createReadStream } from "node:fs";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
 import { randomBytes } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { describe, expect, it } from "vitest";
 
-import { EOCD, EOCD_LEN, ZIP_METHOD_DEFLATE } from "../lib/zip/constants.js";
+import {
+  DATA_DESCRIPTOR_WITH_SIG_LEN,
+  DD_SIG,
+  EOCD,
+  EOCD_LEN,
+  ZIP_FLAG_DATA_DESCRIPTOR,
+  ZIP_FLAG_UTF8,
+  ZIP_METHOD_DEFLATE,
+  ZIP_SIGNATURE_LEN,
+} from "../lib/zip/constants.js";
 import {
   FIXTURE_FILES,
   TINY_PDF,
@@ -19,22 +29,82 @@ import {
   writeDataDescriptorNoSizeStub,
   writeLargeStoredZipFile,
   writeLocalHeaderOnly,
+  writeLocalHeaderStub,
   writeMalformedExtraStub,
   writeZip,
   writeZip64SizeStub,
 } from "./test-support/write-zip.js";
 import { type UnzipOptions, type ZipEntry, unzipEncrypted } from "../lib/unzip.js";
 import { isPdfMagic, isPdfPath } from "../lib/detect/detect.js";
+import { PULL_CHUNK_SIZE } from "../lib/stream/pull.js";
 
 /**
  * Wall-clock guard for the unknown-length (APPNOTE bit 3) scan, not a benchmark:
  * a block-wise scan of these fixtures costs milliseconds, while a per-byte
- * re-inflate of the whole accumulator costs minutes. Keep the assertion — it is
- * the only thing that fails when that scan becomes quadratic again.
+ * re-inflate of the whole accumulator costs minutes.
+ *
+ * It guards only the fixtures it is attached to, and those bodies are zeros —
+ * a couple of KB compressed, so one or two probes cover the whole entry no
+ * matter how the scan is written. Cost as a function of entry size is pinned by
+ * "scales close to linearly with entry size" below, not here.
  */
 const SCAN_BUDGET_MS = 5000;
 /** Room for the budget assertion to be reported instead of killing the run. */
 const SCAN_TEST_TIMEOUT_MS = 20_000;
+/**
+ * Zeros deflate about 1000:1, so this body compresses to ~32 KB: past zlib's
+ * default 16 KB write buffer (`inflate.write` returns false and the pump parks
+ * on `drain`) yet inside one `PULL_CHUNK_SIZE` read, so the boundary probe
+ * reaches Z_STREAM_END on the first chunk. Under ~17 MB the compressed stream
+ * fits the write buffer, the pump never parks, and the window below cannot be
+ * hit at all.
+ */
+const BACKPRESSURE_BODY_SIZE = 32 * 1024 * 1024;
+/**
+ * Long enough for the inflate to fill the entry's buffer and stall. Destroying
+ * on the same turn (the two tests above) aborts inside `pull.read` instead,
+ * which is the path that already works — do not "simplify" this delay away.
+ */
+const BACKPRESSURE_DESTROY_DELAY_MS = 100;
+/** Four timed reads; ~11 s while the scan is quadratic, ~1 s once it is not. */
+const SCALING_TEST_TIMEOUT_MS = 120_000;
+/** ~130 ms today: far enough above timer noise to divide by. */
+const SCALING_SMALL_SIZE = 4 * 1024 * 1024;
+/** 8× `SCALING_SMALL_SIZE`, so a linear reader costs ~8× the time. */
+const SCALING_LARGE_SIZE = 8 * SCALING_SMALL_SIZE;
+/**
+ * 8× the data. The linear reference is the known-size deflate path over the same
+ * bodies on the same machine: 4 MB 10.8 ms → 32 MB 99.0 ms, i.e. **9.2×**, a
+ * little over 8× because per-byte cost grows with GC pressure. The probe-per-chunk
+ * scan instead measures 31.6×, 33.3×, 35.8×, 37.3× (4 MB ≈ 0.13 s, 32 MB ≈ 4.6 s).
+ * 16× sits between the two regimes: ~2× under the cheapest quadratic run and
+ * ~1.7× over the linear reference.
+ *
+ * Both halves of the scan have to go for this to pass: the probe that re-inflates
+ * the accumulator, and the `Buffer.concat` that regrows the whole plaintext
+ * accumulator once per pull chunk (quadratic in memcpy on incompressible data).
+ */
+const SCALING_MAX_FACTOR = 16;
+/** Zeros again: ~256 KB of deflate that the skip path inflates to 256 MB. */
+const SKIP_BOMB_SIZE = 256 * 1024 * 1024;
+/** Cap that must not turn into `entry exceeds maxEntrySize` for a skipped entry. */
+const SKIP_BOMB_MAX_ENTRY_SIZE = 64 * 1024;
+/** Chunks fed to the streaming deflate that builds a bomb fixture. */
+const BOMB_FIXTURE_CHUNK_SIZE = 1024 * 1024;
+/** Interval of the rss sampler; the probe blocks the loop, so keep it short. */
+const RSS_SAMPLE_INTERVAL_MS = 10;
+/**
+ * Measured peak rss growth while skipping the bomb: 517, 518, 520 MB — two
+ * 256 MB probe buffers alive at once, one per pull chunk of the compressed
+ * stream. A skip that only aligns the descriptor keeps a 64 KB accumulator and
+ * zlib's own buffers, so 64 MB is ~8× under today's number and far above what
+ * streaming needs. rss (not `heapUsed`) because the buffer is external.
+ */
+const SKIP_BOMB_RSS_BUDGET_MB = 64;
+/** The bomb fixture deflates 256 MB of zeros chunk by chunk before the read. */
+const SKIP_BOMB_TIMEOUT_MS = 60_000;
+/** BZIP2 (APPNOTE method 12): a real method this reader still has to reject. */
+const ZIP_METHOD_BZIP2 = 12;
 
 function chunked(data: Buffer, size = 3): Readable {
   const chunks: Buffer[] = [];
@@ -77,6 +147,122 @@ async function collectNamed(
   }
 
   return out;
+}
+
+/** `--expose-gc` is not on for this suite; use `gc` only when it happens to be. */
+function collectGarbage(): void {
+  (globalThis as { gc?: () => void }).gc?.();
+}
+
+/**
+ * Peak rss across a read. A single sample after the fact misses the allocation:
+ * the boundary probe frees its buffer as soon as the entry ends.
+ */
+function trackPeakRss(): { stop: () => number } {
+  let peak = process.memoryUsage.rss();
+  const timer = setInterval(() => {
+    peak = Math.max(peak, process.memoryUsage.rss());
+  }, RSS_SAMPLE_INTERVAL_MS);
+
+  return {
+    stop(): number {
+      clearInterval(timer);
+
+      return Math.max(peak, process.memoryUsage.rss());
+    },
+  };
+}
+
+/**
+ * One bit-3 deflate entry (zero local crc/sizes + 16-byte descriptor) whose
+ * body is deflated chunk by chunk, so a multi-hundred-MB fixture never holds
+ * its own plaintext. `writeZip` would allocate all of it, and that discarded
+ * buffer would sit in rss and hide what the reader itself allocates.
+ */
+async function writeZeroBombEntry(name: string, size: number): Promise<Buffer> {
+  const chunk = Buffer.alloc(BOMB_FIXTURE_CHUNK_SIZE, 0x00);
+  const deflate = createDeflateRaw();
+  const parts: Buffer[] = [];
+
+  deflate.on("data", (piece: Buffer) => {
+    parts.push(Buffer.from(piece));
+  });
+
+  let crc = 0;
+  let remaining = size;
+
+  while (remaining > 0) {
+    const slice = chunk.subarray(0, Math.min(remaining, chunk.length));
+
+    crc = crc32(slice, crc) >>> 0;
+    if (!deflate.write(slice)) {
+      await once(deflate, "drain");
+    }
+    remaining -= slice.length;
+  }
+  deflate.end();
+  await finished(deflate);
+
+  const payload = Buffer.concat(parts);
+  const descriptor = Buffer.alloc(DATA_DESCRIPTOR_WITH_SIG_LEN);
+
+  descriptor.writeUInt32LE(DD_SIG, 0);
+  descriptor.writeUInt32LE(crc, 4);
+  descriptor.writeUInt32LE(payload.length, 8);
+  descriptor.writeUInt32LE(size, 12);
+
+  return Buffer.concat([
+    writeLocalHeaderOnly({
+      flags: ZIP_FLAG_UTF8 | ZIP_FLAG_DATA_DESCRIPTOR,
+      method: ZIP_METHOD_DEFLATE,
+      name,
+    }),
+    payload,
+    descriptor,
+  ]);
+}
+
+/**
+ * Wall-clock of one full unknown-length read, fixture build excluded. Bytes go
+ * to a counting sink so the timing is the reader's cost, not a concat of the
+ * whole entry.
+ */
+async function timeUnknownLengthRead(size: number): Promise<number> {
+  const zip = writeZip([{ data: randomBytes(size), method: ZIP_METHOD_DEFLATE, name: "big.bin" }], {
+    dataDescriptor: "16",
+    omitLocalSizes: true,
+  });
+  let read = 0;
+  const started = performance.now();
+
+  for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+    await pipeline(
+      entry,
+      new Writable({
+        highWaterMark: PULL_CHUNK_SIZE,
+        write(piece: Buffer, _enc, cb): void {
+          read += piece.length;
+          cb();
+        },
+      }),
+    );
+  }
+  const elapsed = performance.now() - started;
+
+  expect(read).toBe(size);
+
+  return elapsed;
+}
+
+/**
+ * Best of two reads. Noise (JIT, a busy CI box, a GC pause) can only make a read
+ * slower, so the minimum is the estimate that keeps the ratio below meaningful.
+ */
+async function bestUnknownLengthRead(size: number): Promise<number> {
+  const first = await timeUnknownLengthRead(size);
+  const second = await timeUnknownLengthRead(size);
+
+  return Math.min(first, second);
 }
 
 describe("local header parser", () => {
@@ -129,6 +315,38 @@ describe("local header parser", () => {
 
     await expect(collectNamed(Readable.from([zip]), "secret")).rejects.toThrow(
       /malformed extra field/,
+    );
+  });
+
+  it("throws when the next record is neither a local header, central directory, nor EOCD", async () => {
+    const body = Buffer.from("hello\n");
+    // A data descriptor where the next local header belongs: the shape a
+    // misaligned bit-3 scan leaves behind. The parser must not guess past it.
+    const stray = Buffer.alloc(ZIP_SIGNATURE_LEN);
+
+    stray.writeUInt32LE(DD_SIG, 0);
+    const zip = Buffer.concat([
+      writeLocalHeaderOnly({
+        compressedSize: body.length,
+        crc: crc32(body) >>> 0,
+        method: 0,
+        name: "a.txt",
+        uncompressedSize: body.length,
+      }),
+      body,
+      stray,
+    ]);
+
+    await expect(collectNamed(Readable.from([zip]), "")).rejects.toThrow(
+      /bad zip signature 0x8074b50/,
+    );
+  });
+
+  it("throws on a compression method other than stored or deflate", async () => {
+    const zip = writeLocalHeaderStub({ method: ZIP_METHOD_BZIP2, name: "old.bin" });
+
+    await expect(collectNamed(Readable.from([zip]), "")).rejects.toThrow(
+      /unsupported compression method 12: old\.bin/,
     );
   });
 });
@@ -626,6 +844,52 @@ describe("unknown-length data descriptor", () => {
     expect(entries[0]?.data.equals(Buffer.from("hello\n"))).toBe(true);
   });
 
+  it("emits more than one data chunk for an unknown-length deflate file larger than PULL_CHUNK_SIZE", async () => {
+    const payload = randomBytes(PULL_CHUNK_SIZE + 1);
+    const zip = writeZip([{ data: payload, method: ZIP_METHOD_DEFLATE, name: "big.bin" }], {
+      dataDescriptor: "16",
+      omitLocalSizes: true,
+    });
+    let chunkCount = 0;
+    const chunks: Buffer[] = [];
+
+    for await (const entry of unzipEncrypted(chunked(zip, 8192), { password: "" })) {
+      expect(entry.path).toBe("big.bin");
+      // Concatenated length still passes if inflateRawSync pushes once; count `data` events.
+      entry.on("data", (chunk: Buffer) => {
+        chunkCount += 1;
+        chunks.push(Buffer.from(chunk));
+      });
+      await once(entry, "end");
+    }
+
+    expect(Buffer.concat(chunks).equals(payload)).toBe(true);
+    expect(chunkCount).toBeGreaterThan(1);
+  });
+
+  it("extracts an encrypted unknown-length deflate file larger than PULL_CHUNK_SIZE", async () => {
+    const payload = randomBytes(PULL_CHUNK_SIZE + 1);
+    const zip = writeZip([{ data: payload, method: ZIP_METHOD_DEFLATE, name: "big.bin" }], {
+      dataDescriptor: "16",
+      omitLocalSizes: true,
+      password: "secret",
+    });
+    let chunkCount = 0;
+    const chunks: Buffer[] = [];
+
+    for await (const entry of unzipEncrypted(chunked(zip, 8192), { password: "secret" })) {
+      expect(entry.path).toBe("big.bin");
+      entry.on("data", (chunk: Buffer) => {
+        chunkCount += 1;
+        chunks.push(Buffer.from(chunk));
+      });
+      await once(entry, "end");
+    }
+
+    expect(Buffer.concat(chunks).equals(payload)).toBe(true);
+    expect(chunkCount).toBeGreaterThan(1);
+  });
+
   it("rejects a wrong password on an encrypted unknown-length entry", async () => {
     const zip = writeZip(
       [{ data: Buffer.from("hello\n"), method: ZIP_METHOD_DEFLATE, name: "a.txt" }],
@@ -737,6 +1001,60 @@ describe("unknown-length data descriptor", () => {
     expect(entries[0]?.data.equals(TINY_PDF)).toBe(true);
   });
 
+  // Keep this before the scaling test: rss growth is measured against a baseline,
+  // and a test that has just allocated hundreds of MB leaves freed pages the next
+  // allocation reuses, which shrinks the delta (518 MB alone, 314 MB after it).
+  it(
+    "does not allocate the plaintext of a filtered unknown-length bomb",
+    { timeout: SKIP_BOMB_TIMEOUT_MS },
+    async () => {
+      // Skipping is allowed to inflate (the descriptor has to be found) but not to
+      // keep the output: the boundary probe returns the entry's whole plaintext,
+      // and on this path it is called with no `maxOutputLength` at all, so a
+      // filtered bomb is materialised even under a small `maxEntrySize`.
+      const zip = Buffer.concat([
+        await writeZeroBombEntry("bomb.bin", SKIP_BOMB_SIZE),
+        writeZip(
+          [{ data: Buffer.from("after\n"), method: ZIP_METHOD_DEFLATE, name: "after.txt" }],
+          { dataDescriptor: "16", omitLocalSizes: true },
+        ),
+      ]);
+
+      collectGarbage();
+      const baseline = process.memoryUsage.rss();
+      const rss = trackPeakRss();
+      let entries: { data: Buffer; path: string; type: ZipEntry["type"] }[] = [];
+      let peakRssGrowthMb = 0;
+
+      try {
+        entries = await collectNamed(chunked(zip, PULL_CHUNK_SIZE), "", (n) => n === "after.txt", {
+          maxEntrySize: SKIP_BOMB_MAX_ENTRY_SIZE,
+        });
+      } finally {
+        peakRssGrowthMb = Math.round((rss.stop() - baseline) / (1024 * 1024));
+      }
+
+      // The skip must stay silent about the cap (public contract), and cheap.
+      expect(entries.map((e) => e.path)).toEqual(["after.txt"]);
+      expect(entries[0]?.data.equals(Buffer.from("after\n"))).toBe(true);
+      expect(peakRssGrowthMb).toBeLessThan(SKIP_BOMB_RSS_BUDGET_MB);
+    },
+  );
+
+  it(
+    "scales close to linearly with entry size on the unknown-length path",
+    { timeout: SCALING_TEST_TIMEOUT_MS },
+    async () => {
+      // A ratio, not a millisecond budget: a fixed budget on a body this size is
+      // CI-flaky, while re-inflating the whole accumulator once per pull chunk is
+      // quadratic and shows up as a factor no amount of CI noise explains.
+      const small = await bestUnknownLengthRead(SCALING_SMALL_SIZE);
+      const large = await bestUnknownLengthRead(SCALING_LARGE_SIZE);
+
+      expect(large / small).toBeLessThan(SCALING_MAX_FACTOR);
+    },
+  );
+
   it(
     "continues iteration when a large unknown-length entry is destroyed unread",
     { timeout: SCAN_TEST_TIMEOUT_MS },
@@ -788,9 +1106,46 @@ describe("unknown-length data descriptor", () => {
       for await (const entry of unzipEncrypted(chunked(zip, 8192), { password: "secret" })) {
         seen.push(entry.path);
         if (entry.path === "big.bin") {
-          // Unknown-length pushes only after Z_STREAM_END, so `once("readable")`
-          // would wait for the full scan. Start consume then destroy on this turn.
+          // Start consume then destroy on this turn (same-tick abort).
           entry.read();
+          entry.destroy();
+          continue;
+        }
+        tail = await collect(entry);
+      }
+
+      expect(seen).toEqual(["big.bin", "after.txt"]);
+      expect(tail?.equals(Buffer.from("after\n"))).toBe(true);
+    },
+  );
+
+  it(
+    "continues iteration when an unknown-length entry is destroyed while the inflate is backpressured",
+    { timeout: SCAN_TEST_TIMEOUT_MS },
+    async () => {
+      // Same-tick destroy (tests above) never parks inflate on backpressure.
+      // Waiting lets zlib fill the entry buffer so `write` defers; `destroy()`
+      // must still unread overshoot and yield `after.txt`, not drop the rest
+      // of the archive with no error.
+      const zip = writeZip(
+        [
+          {
+            data: Buffer.alloc(BACKPRESSURE_BODY_SIZE, 0x00),
+            method: ZIP_METHOD_DEFLATE,
+            name: "big.bin",
+          },
+          { data: Buffer.from("after\n"), method: ZIP_METHOD_DEFLATE, name: "after.txt" },
+        ],
+        { dataDescriptor: "16", omitLocalSizes: true },
+      );
+      const seen: string[] = [];
+      let tail: Buffer | undefined;
+
+      for await (const entry of unzipEncrypted(Readable.from([zip]), { password: "" })) {
+        seen.push(entry.path);
+        if (entry.path === "big.bin") {
+          entry.read();
+          await sleep(BACKPRESSURE_DESTROY_DELAY_MS);
           entry.destroy();
           continue;
         }
@@ -847,6 +1202,26 @@ describe("unknown-length data descriptor", () => {
 
     expect(entries.map((e) => e.path)).toEqual(["a.txt"]);
     expect(entries[0]?.data.equals(Buffer.from("hello"))).toBe(true);
+  });
+
+  it("yields a stored bit3 directory instead of demanding a local size", async () => {
+    // `unknownLength` already excludes directories — an empty method-8 directory
+    // has no deflate payload to scan — but the `no size in local header` throw
+    // does not, so a stored directory with bit 3 and zero sizes is rejected even
+    // though it has no body at all and the next 16 bytes are its descriptor.
+    const zip = writeZip(
+      [
+        { data: Buffer.alloc(0), directory: true, method: 0, name: "dir/" },
+        { data: Buffer.from("hello"), name: "a.txt" },
+      ],
+      { dataDescriptor: "16", omitLocalSizes: true },
+    );
+    const entries = await collectNamed(Readable.from([zip]), "");
+
+    expect(entries.map((e) => e.path)).toEqual(["dir/", "a.txt"]);
+    expect(entries[0]?.type).toBe("Directory");
+    expect(entries[0]?.data.length).toBe(0);
+    expect(entries[1]?.data.equals(Buffer.from("hello"))).toBe(true);
   });
 
   it("extracts a yielded unknown-length directory then a file from chunked input", async () => {

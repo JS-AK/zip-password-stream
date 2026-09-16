@@ -2,7 +2,7 @@
 
 Streaming **ZipCrypto** unzip **and zip** for **Node.js**. Parse a password-protected zip from a `node:stream` `Readable` in one pass, reading local file headers only, or write one to a `Writable` without buffering file payloads. Entries arrive through `for await`; each file body is itself a stream.
 
-There is no `files[]` list and no central-directory seek on read, so the archive is never buffered in memory and never needs to be seekable — a socket or an HTTP response works as well as a file.
+There is no `files[]` list and no central-directory seek on read, so the archive is not buffered whole-cloth and never needs to be seekable — a socket or an HTTP response works as well as a file. Yielded entry bodies stream; skipping an unknown-length bit-3 entry still inflates internally to find the data descriptor.
 
 The public API is Node `Readable` / `Writable` only. This package does not export Web Streams and is not a browser bundle.
 

@@ -189,7 +189,7 @@ export async function writeLargeStoredZipFile(
   cd.writeUInt16LE(DOS_DATE_DEFAULT, 14);
   cd.writeUInt32LE(crc, 16);
   cd.writeUInt32LE(size, 20);
-  cd.writeUInt32LE(size, 22);
+  cd.writeUInt32LE(size, 24);
   cd.writeUInt16LE(nameBuf.length, 28);
   cd.writeUInt16LE(0, 30);
   cd.writeUInt16LE(0, 32);
